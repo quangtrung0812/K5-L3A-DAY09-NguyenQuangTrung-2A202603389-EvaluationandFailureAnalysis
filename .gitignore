@@ -1,5 +1,26 @@
+# Secrets (skeleton-lab)
+.env
+.env.*
+!.env.example
+
+# Python / OS
+.venv/
 __pycache__/
+*.py[cod]
 *.pyc
-src/reports/
-src/traces/
+.pytest_cache/
+.DS_Store
+
+# Runtime output
 *.sqlite
+*.sqlite-*
+traces/
+src/traces/
+src/reports/
+student_drop/
+src/reports/hidden_grade.json
+src/reports/bonus_hidden.json
+
+# Instructor-only hidden pack. Never push it to this repo.
+src/eval/instructor/
+
