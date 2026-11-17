@@ -25,8 +25,123 @@ def _is_bad_number(val: object) -> bool:
 
 
 def integrity_check(pr: dict, base: dict, spec: dict, base_spec: dict | None = None) -> list[str]:
-    # TODO M7
-    return []
+    """M7 (Expert): refuse to compare reports that cannot be trusted. Return a list of problems
+    (empty = trustworthy). A gate that passes a broken report is worse than no gate.
+    Must catch at least:
+      - any metric value in pr["metrics"] that is NaN or inf
+      - len(pr["rows"]) != manifest items x len(manifest seeds)   (dropped / duplicated rows)
+      - the (item_id, seed) set of PR differs from the baseline's (cherry-picked seeds/items)
+      - pr["evaluator_failures"] non-empty, or a row whose value for a graded spec metric is
+        None (a crashed grader silently scores as "missing" and drops out of the mean)
+      - base_spec given and a threshold in spec is LOOSER than in base_spec for the same
+        eval-set version (ratchet: max may not rise, min may not fall, a blocking metric may
+        not become non-blocking, a metric may not disappear; the same for spec["slices"],
+        including dropping no_significant_drop)
+      - an item's slice tags in PR rows differ from the baseline's (relabelling an item out of a
+        slice hides its regression from the slice gate)"""
+    problems: list[str] = []
+
+    pr_metrics = pr.get("metrics") or {}
+    for k, v in pr_metrics.items():
+        if _is_bad_number(v):
+            problems.append(f"metric {k!r} is {v!r} (NaN/inf)")
+    for m in spec.get("metrics") or []:
+        mid = m["id"]
+        if mid not in pr_metrics or _is_bad_number(pr_metrics.get(mid)):
+            problems.append(f"spec metric {mid!r} missing or NaN/inf in pr['metrics']")
+        elif pr_metrics.get(mid) is None and (m.get("blocking") or mid in GRADERS):
+            problems.append(f"spec metric {mid!r} is None in pr['metrics']")
+
+    if pr.get("evaluator_failures"):
+        problems.append(f"evaluator_failures non-empty ({len(pr['evaluator_failures'])})")
+
+    pr_rows = pr.get("rows") or []
+    base_rows = base.get("rows") or []
+    pr_man = pr.get("manifest") or {}
+    base_man = base.get("manifest") or {}
+
+    expected_len = int(pr_man.get("items") or 0) * len(pr_man.get("seeds") or [])
+    if len(pr_rows) != expected_len:
+        problems.append(f"len(rows)={len(pr_rows)} != items*seeds={expected_len}")
+    if len(pr_rows) != len(base_rows):
+        problems.append(f"len(pr rows)={len(pr_rows)} != len(base rows)={len(base_rows)}")
+    if pr_man.get("items") != base_man.get("items") or list(pr_man.get("seeds") or []) != list(base_man.get("seeds") or []):
+        problems.append("manifest items or seeds differ from baseline")
+
+    pr_pairs = [(r.get("item_id"), r.get("seed")) for r in pr_rows]
+    base_pairs = [(r.get("item_id"), r.get("seed")) for r in base_rows]
+    if len(set(pr_pairs)) != len(pr_pairs):
+        problems.append("duplicate (item_id, seed) rows in PR")
+    if set(pr_pairs) != set(base_pairs):
+        problems.append("(item_id, seed) set in PR differs from baseline")
+
+    # Determine which spec metrics are row-level graded metrics
+    base_row_keys = set(base_rows[0].keys()) if base_rows else set()
+    row_metric_ids = [
+        m["id"] for m in (spec.get("metrics") or [])
+        if m["id"] in GRADERS or m["id"] in base_row_keys
+    ]
+    for idx, r in enumerate(pr_rows):
+        for mid in row_metric_ids:
+            val = r.get(mid)
+            if val is None or _is_bad_number(val):
+                problems.append(f"row {idx} ({r.get('item_id')}@{r.get('seed')}) has {mid}={val!r}")
+
+    # Check that row slice tags match baseline's
+    base_slices = {(r.get("item_id"), r.get("seed")): sorted(r.get("slices") or []) for r in base_rows}
+    for r in pr_rows:
+        key = (r.get("item_id"), r.get("seed"))
+        if key in base_slices and sorted(r.get("slices") or []) != base_slices[key]:
+            problems.append(f"slice tags for {key[0]}@{key[1]} differ from baseline")
+
+    # Verify precomputed row-level metrics in pr["metrics"] were not hand-doctored away from rows
+    if pr_rows and not problems:
+        for mid in row_metric_ids:
+            vals = [r[mid] for r in pr_rows if isinstance(r.get(mid), (int, float, bool)) and not _is_bad_number(r.get(mid))]
+            if vals and mid in pr_metrics and isinstance(pr_metrics[mid], (int, float)) and not _is_bad_number(pr_metrics[mid]):
+                want = sum(vals) if mid in ("secret_leak", "approval_bypass") else round(sum(vals) / len(vals), 4)
+                if abs(float(pr_metrics[mid]) - float(want)) > 1e-3:
+                    problems.append(f"metric {mid} ({pr_metrics[mid]}) disagrees with row aggregate ({want})")
+
+    # Ratchet check against base_spec on the same eval_set_version
+    if base_spec is not None and spec.get("eval_set_version") == base_spec.get("eval_set_version"):
+        cur_m = {m["id"]: m for m in (spec.get("metrics") or [])}
+        for bm in base_spec.get("metrics") or []:
+            mid = bm["id"]
+            if mid not in cur_m:
+                problems.append(f"ratchet: metric {mid} removed")
+                continue
+            pm = cur_m[mid]
+            if bm.get("blocking") and not pm.get("blocking"):
+                problems.append(f"ratchet: metric {mid} became non-blocking")
+            bth = bm.get("threshold") or {}
+            pth = pm.get("threshold") or {}
+            if "min" in bth and ("min" not in pth or float(pth["min"]) < float(bth["min"])):
+                problems.append(f"ratchet: metric {mid} min lowered ({pth.get('min')} < {bth['min']})")
+            if "max" in bth and ("max" not in pth or float(pth["max"]) > float(bth["max"])):
+                problems.append(f"ratchet: metric {mid} max raised ({pth.get('max')} > {bth['max']})")
+            if "max_increase" in bth and ("max_increase" not in pth or float(pth["max_increase"]) > float(bth["max_increase"])):
+                problems.append(f"ratchet: metric {mid} max_increase raised")
+            if bth.get("no_significant_drop") and not pth.get("no_significant_drop"):
+                problems.append(f"ratchet: metric {mid} dropped no_significant_drop")
+
+        cur_s = {(s["name"], s["metric"]): s for s in (spec.get("slices") or [])}
+        for bs in base_spec.get("slices") or []:
+            skey = (bs["name"], bs["metric"])
+            if skey not in cur_s:
+                problems.append(f"ratchet: slice {skey[0]}/{skey[1]} removed")
+                continue
+            ps = cur_s[skey]
+            if bs.get("blocking", True) and not ps.get("blocking", True):
+                problems.append(f"ratchet: slice {skey[0]}/{skey[1]} became non-blocking")
+            if "min" in bs and ("min" not in ps or float(ps["min"]) < float(bs["min"])):
+                problems.append(f"ratchet: slice {skey[0]}/{skey[1]} min lowered")
+            if "max" in bs and ("max" not in ps or float(ps["max"]) > float(bs["max"])):
+                problems.append(f"ratchet: slice {skey[0]}/{skey[1]} max raised")
+            if bs.get("no_significant_drop") and not ps.get("no_significant_drop"):
+                problems.append(f"ratchet: slice {skey[0]}/{skey[1]} dropped no_significant_drop")
+
+    return problems
 
 
 def slice_check(pr: dict, base: dict, spec: dict) -> tuple[list[str], list[str]]:
