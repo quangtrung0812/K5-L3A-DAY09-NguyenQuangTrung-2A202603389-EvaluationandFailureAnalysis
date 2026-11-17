@@ -66,8 +66,29 @@ def rogan_gladen(observed_rate: float, sensitivity: float, specificity: float) -
 
 def paired_bootstrap(a: Sequence[float], b: Sequence[float], *, n_resamples: int = 1000,
                      rng: int = 2027, confidence: float = 0.95) -> tuple[float, float, float]:
-    # TODO M4
-    raise NotImplementedError
+    """a[i], b[i] = per-item mean over seeds, SAME items, SAME order.
+    Return (mean(a)-mean(b), lo, hi) with scipy.stats.bootstrap(paired=True, method="percentile",
+    rng=numpy.random.default_rng(rng)). If a == b everywhere return (0.0, 0.0, 0.0)."""
+    import numpy as np
+    from scipy.stats import bootstrap
+
+    arr_a = np.asarray(a, dtype=float)
+    arr_b = np.asarray(b, dtype=float)
+    if arr_a.shape != arr_b.shape or arr_a.size == 0:
+        raise ValueError("a and b must be non-empty sequences of equal length")
+    if np.allclose(arr_a, arr_b):
+        return (0.0, 0.0, 0.0)
+    diff = float(np.mean(arr_a) - np.mean(arr_b))
+    res = bootstrap(
+        (arr_a, arr_b),
+        statistic=lambda x, y, axis=-1: np.mean(x, axis=axis) - np.mean(y, axis=axis),
+        n_resamples=n_resamples,
+        paired=True,
+        method="percentile",
+        confidence_level=confidence,
+        rng=np.random.default_rng(rng),
+    )
+    return (diff, float(res.confidence_interval.low), float(res.confidence_interval.high))
 
 
 def pass_at_k(n: int, c: int, k: int) -> float:
